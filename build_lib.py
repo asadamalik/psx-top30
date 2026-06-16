@@ -58,7 +58,31 @@ def _fetch_eod_charts(symbols):
 def compute_embed(det, fetch_charts=True):
     det = (det.dropna(subset=["Date"])
               .sort_values("Volume", ascending=False)
-              .drop_duplicates(["Date", "Symbol"]))
+              .drop_duplicates(["Date", "Symbol"])).copy()
+
+    # Pull authoritative EOD history once (also used for the charts), and use it
+    # to correct each day's close/volume — the source spreadsheet can carry stale
+    # values forward, which skews the movers/history. EOD is the exchange's own data.
+    charts = _fetch_eod_charts(sorted(det["Symbol"].unique())) if fetch_charts else {}
+    if charts:
+        eod = {}
+        for sym, ch in charts.items():
+            for i, dd in enumerate(ch["d"]):
+                eod[(sym, dd)] = (ch["c"][i], ch["v"][i])
+        cur, vol, corrected = [], [], 0
+        for r in det.itertuples():
+            key = (r.Symbol, int(r.Date.strftime("%Y%m%d")))
+            if key in eod:
+                c, v = eod[key]
+                if abs(c - r.Current) > 1e-6:
+                    corrected += 1
+                cur.append(c); vol.append(v)
+            else:
+                cur.append(r.Current); vol.append(r.Volume)
+        det["Current"] = cur
+        det["Volume"] = vol
+        print(f"Reconciled {corrected} day-prices against PSX EOD.")
+
     dates  = sorted(det["Date"].unique())
     latest = dates[-1]
     price   = {(r.Date, r.Symbol): r.Current for r in det.itertuples()}
@@ -143,13 +167,8 @@ def compute_embed(det, fetch_charts=True):
 
     out = dict(snapshot=dict(date=str(latest), top_n=top_n,
                new_entries=new_latest, dropped=drop_latest),
-               stats=stats, positions=opens + closeds, movers=movers, history=history)
-
-    if fetch_charts:
-        print(f"Fetching price history for {len(set(det['Symbol']))} symbols…")
-        out["charts"] = _fetch_eod_charts(sorted(det["Symbol"].unique()))
-    else:
-        out["charts"] = {}
+               stats=stats, positions=opens + closeds, movers=movers, history=history,
+               charts=charts)
     return out
 
 
