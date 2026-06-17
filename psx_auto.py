@@ -64,7 +64,9 @@ def fetch_marketwatch():
         if c is None:
             continue
         if sym not in best or vol > best[sym]["vol"]:
+            listed = tds[2].get_text(strip=True)
             best[sym] = dict(symbol=sym, sector=tds[1].get_text(strip=True),
+                listed_in=listed, shariah=("KMI" in listed.upper()),
                 o=num(tds[4].get_text(strip=True)), h=num(tds[5].get_text(strip=True)),
                 l=num(tds[6].get_text(strip=True)), c=c,
                 chg=num(tds[9].get_text(strip=True)) or 0.0, vol=vol)
@@ -155,6 +157,33 @@ def main():
 
     det = snaps_to_det(snaps)
     embed = build_lib.compute_embed(det, fetch_charts=True)
+
+    # attach a symbol -> sector map (from the full market-watch) and a build time,
+    # persisted so it stays populated even on weekend/holiday runs
+    sectors = json.load(open(os.path.join(STATE, "sectors.json"))) \
+        if os.path.exists(os.path.join(STATE, "sectors.json")) else {}
+    try:
+        for r in (rows if today.weekday() < 5 else []):
+            if r.get("sector"):
+                sectors[r["symbol"]] = r["sector"]
+        json.dump(sectors, open(os.path.join(STATE, "sectors.json"), "w"))
+    except Exception:
+        pass
+    embed["sectors"] = sectors
+
+    # symbol -> Shariah-compliant (KMI index membership), persisted like sectors
+    shariah = json.load(open(os.path.join(STATE, "shariah.json"))) \
+        if os.path.exists(os.path.join(STATE, "shariah.json")) else {}
+    try:
+        for r in (rows if today.weekday() < 5 else []):
+            shariah[r["symbol"]] = bool(r.get("shariah"))
+        json.dump(shariah, open(os.path.join(STATE, "shariah.json"), "w"))
+    except Exception:
+        pass
+    embed["shariah"] = shariah
+
+    embed["built_at"] = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
     build_lib.render_html(TEMPLATE, embed, OUT)
     print(f"Dashboard written -> {OUT}")
     print(f"Open it in a browser. History spans {embed['snapshot']['date']} "

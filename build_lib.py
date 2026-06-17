@@ -8,13 +8,136 @@ compute_embed(det, fetch_charts=True) takes a long-format DataFrame with columns
 and returns the dict the dashboard expects:
     snapshot, stats, positions, movers, history, charts
 """
-import json, urllib.request, datetime as _dt
+import json, re, urllib.request, datetime as _dt
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import pandas as pd, numpy as np
+from bs4 import BeautifulSoup
 
 WINDOW = 10        # trading days to follow each new entry
 CHART_DAYS = 180   # sessions of price history per symbol for the chart
 UA = {"User-Agent": "Mozilla/5.0 (psx-dashboard)"}
+
+
+def _cnum(s):
+    if s is None:
+        return None
+    s = str(s).strip().replace(",", "").replace("%", "")
+    neg = s.startswith("(") and s.endswith(")")
+    s = s.strip("()")
+    try:
+        v = float(s)
+        return -v if neg else v
+    except ValueError:
+        return None
+
+
+def _fetch_company(sym):
+    """Parse fundamentals, insider filings and catalysts from the PSX company page."""
+    try:
+        req = urllib.request.Request(f"https://dps.psx.com.pk/company/{sym}", headers=UA)
+        html = urllib.request.urlopen(req, timeout=25).read().decode("utf-8", "ignore")
+    except Exception:
+        return None
+    soup = BeautifulSoup(html, "lxml")
+    T = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+
+    def grab(label, pat=r"\s*([-\(\d,\.\)]+)"):
+        m = re.search(label + pat, T)
+        return _cnum(m.group(1)) if m else None
+
+    title = soup.title.get_text() if soup.title else ""
+    mname = re.search(r"Stock quote for (.+?) - Pakistan Stock Exchange", title)
+    name = mname.group(1).strip() if mname else sym
+    msec = re.search(re.escape(name) + r"\s+([A-Z][A-Z &/\-]{3,}?)\s+Rs\.", T)
+    sector = msec.group(1).strip() if msec else None
+
+    o = dict(name=name, sector=sector)
+    m52 = re.search(r"52-WEEK RANGE[^\d]*([\d,\.]+)\s*[—\-–]\s*([\d,\.]+)", T)
+    if m52:
+        o["wk52_low"] = _cnum(m52.group(1))
+        o["wk52_high"] = _cnum(m52.group(2))
+    mc = grab(r"Market Cap \(000'?\s*s\s*\)")
+    o["mcap_mn"] = round(mc / 1000, 1) if mc else None            # millions of PKR
+    o["shares"] = grab(r"\bShares\b")
+    ff = re.search(r"Free Float\s*([\d\.]+)%", T)
+    o["free_float_pct"] = _cnum(ff.group(1)) if ff else None
+    o["pe"] = grab(r"P/E Ratio \(TTM\)\s*\*\*")
+    m52 = re.search(r"52-WEEK RANGE[^\d]*([\d,\.]+)\s*[\u2014\-\u2013]\s*([\d,\.]+)", T)
+    if m52:
+        o["low52"] = _cnum(m52.group(1))
+        o["high52"] = _cnum(m52.group(2))
+
+    def table_cols(tbl):
+        rows = tbl.find_all("tr")
+        head = [c.get_text(strip=True) for c in rows[0].find_all(["th", "td"])]
+        body = {}
+        for r in rows[1:]:
+            cells = [c.get_text(strip=True) for c in r.find_all(["td", "th"])]
+            if cells and cells[0]:
+                body[cells[0]] = cells[1:]
+        return head[1:], body
+
+    annual = quarterly = ratios = None
+    for tbl in soup.find_all("table"):
+        rows = tbl.find_all("tr")
+        if not rows:
+            continue
+        head = [c.get_text(strip=True) for c in rows[0].find_all(["th", "td"])]
+        labels = [r.find(["td", "th"]).get_text(strip=True) for r in rows[1:] if r.find(["td", "th"])]
+        if "EPS" in labels and len(head) > 1 and head[0] == "" and head[1][:1].isdigit():
+            annual = table_cols(tbl)
+        elif "EPS" in labels and len(head) > 1 and head[1].startswith("Q"):
+            quarterly = table_cols(tbl)
+        elif any("Margin" in l for l in labels):
+            ratios = table_cols(tbl)
+
+    def series(parsed, key):
+        if not parsed or key not in parsed[1]:
+            return None
+        return [_cnum(x) for x in parsed[1][key]]
+
+    if annual:
+        o["years"] = annual[0]
+        o["eps"] = series(annual, "EPS")
+        o["sales"] = series(annual, "Sales")
+        o["pat"] = series(annual, "Profit after Taxation")
+    if quarterly:
+        o["q_labels"] = quarterly[0]
+        o["q_eps"] = series(quarterly, "EPS")
+        o["q_sales"] = series(quarterly, "Sales")
+        o["q_pat"] = series(quarterly, "Profit after Taxation")
+        o["q_sales"] = series(quarterly, "Sales")
+        o["q_pat"] = series(quarterly, "Profit after Taxation")
+    if ratios:
+        o["gross_margin"] = series(ratios, "Gross Profit Margin (%)")
+        o["net_margin"] = series(ratios, "Net Profit Margin (%)")
+        o["eps_growth"] = series(ratios, "EPS Growth (%)")
+        o["peg"] = series(ratios, "PEG")
+
+    insider, catalysts = [], []
+    for tbl in soup.find_all("table"):
+        for r in tbl.find_all("tr"):
+            cells = [c.get_text(" ", strip=True) for c in r.find_all("td")]
+            if len(cells) >= 2 and re.match(r"[A-Z][a-z]{2} \d", cells[0]):
+                t = cells[1]
+                if re.search(r"Disclosure of Interest|Substantial Shareholder|acquisition of shares|disposal of shares", t, re.I):
+                    insider.append([cells[0], t[:85]])
+                elif re.search(r"dividend|bonus|book closure|sub.?division|split|right|board meeting|EOGM|AGM|merger|results", t, re.I):
+                    catalysts.append([cells[0], t[:85]])
+    o["insider"] = insider[:6]
+    o["catalysts"] = catalysts[:6]
+    return o
+
+
+def _fetch_companies(symbols):
+    out = {}
+    print(f"Fetching company fundamentals for {len(symbols)} symbols…")
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        for sym, c in ex.map(lambda s: (s, _fetch_company(s)), symbols):
+            if c:
+                out[sym] = c
+    return out
 
 
 def _movers(hist, window_dates, topk=15):
@@ -33,25 +156,29 @@ def _movers(hist, window_dates, topk=15):
                 **{"from": str(window_dates[0]), "to": str(window_dates[-1])})
 
 
+def _eod_one(sym):
+    try:
+        req = urllib.request.Request(
+            f"https://dps.psx.com.pk/timeseries/eod/{sym}", headers=UA)
+        rows = json.load(urllib.request.urlopen(req, timeout=25)).get("data", [])
+    except Exception:
+        rows = []
+    if not rows:
+        return sym, None
+    rows = sorted(rows, key=lambda r: r[0])[-CHART_DAYS:]
+    return sym, dict(
+        d=[int(_dt.datetime.utcfromtimestamp(r[0]).strftime("%Y%m%d")) for r in rows],
+        o=[round(r[3], 2) for r in rows],
+        c=[round(r[1], 2) for r in rows],
+        v=[int(r[2]) for r in rows])
+
+
 def _fetch_eod_charts(symbols):
     charts = {}
-    for k, sym in enumerate(symbols):
-        try:
-            req = urllib.request.Request(
-                f"https://dps.psx.com.pk/timeseries/eod/{sym}", headers=UA)
-            rows = json.load(urllib.request.urlopen(req, timeout=25)).get("data", [])
-        except Exception:
-            rows = []
-        if not rows:
-            continue
-        rows = sorted(rows, key=lambda r: r[0])[-CHART_DAYS:]
-        charts[sym] = dict(
-            d=[int(_dt.datetime.utcfromtimestamp(r[0]).strftime("%Y%m%d")) for r in rows],
-            o=[round(r[3], 2) for r in rows],
-            c=[round(r[1], 2) for r in rows],
-            v=[int(r[2]) for r in rows])
-        if k % 25 == 0:
-            print(f"  charts {k}/{len(symbols)}…")
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        for sym, ch in ex.map(_eod_one, symbols):
+            if ch:
+                charts[sym] = ch
     return charts
 
 
@@ -169,11 +296,21 @@ def compute_embed(det, fetch_charts=True):
                new_entries=new_latest, dropped=drop_latest),
                stats=stats, positions=opens + closeds, movers=movers, history=history,
                charts=charts)
+    out["companies"] = _fetch_companies(sorted(det["Symbol"].unique())) if fetch_charts else {}
     return out
 
 
 def render_html(template_path, embed, out_path):
+    import math
+    def _clean(o):
+        if isinstance(o, float):
+            return None if (math.isnan(o) or math.isinf(o)) else o
+        if isinstance(o, dict):
+            return {k: _clean(v) for k, v in o.items()}
+        if isinstance(o, list):
+            return [_clean(v) for v in o]
+        return o
     tpl = open(template_path, encoding="utf-8").read()
-    html = tpl.replace("__DATA__", json.dumps(embed, separators=(",", ":")))
+    html = tpl.replace("__DATA__", json.dumps(_clean(embed), separators=(",", ":")))
     open(out_path, "w", encoding="utf-8").write(html)
     return out_path
