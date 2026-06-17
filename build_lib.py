@@ -47,7 +47,7 @@ def _fetch_company(sym, retries=3):
         except Exception as e:
             last_err = e
             if attempt < retries - 1:
-                time.sleep(1.5 * (attempt + 1) + random.random())
+                time.sleep(3.0 * (attempt + 1) + random.random() * 2)
     if html is None:
         print(f"  [company] {sym}: FAILED after {retries} attempts ({last_err})")
         return None
@@ -145,7 +145,7 @@ def _fetch_company(sym, retries=3):
 def _fetch_companies(symbols):
     out = {}
     print(f"Fetching company fundamentals for {len(symbols)} symbols…")
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    with ThreadPoolExecutor(max_workers=4) as ex:
         for sym, c in ex.map(lambda s: (s, _fetch_company(s)), symbols):
             if c:
                 out[sym] = c

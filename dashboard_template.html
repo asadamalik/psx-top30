@@ -286,6 +286,7 @@ tbody tr:hover{background:var(--panel2)}
 .dt-tbl td{text-align:right;padding:4px 6px;border-bottom:1px solid rgba(35,45,54,.5)}
 .dt-tbl td:first-child{text-align:left;color:var(--dim)}
 .sh-mini{color:#5cc99a;font-size:10px;margin-left:5px;cursor:default}
+.s-badge{display:inline-flex;align-items:center;justify-content:center;width:13px;height:13px;border-radius:50%;background:#5cc99a;color:#0a1f15;font-family:var(--mono);font-size:9px;font-weight:700;line-height:1;vertical-align:middle}
 .shariah-badge{display:inline-flex;align-items:center;gap:3px;font-family:var(--mono);font-size:9px;font-weight:600;color:#5cc99a;background:rgba(63,185,122,.12);border:1px solid #1f4a36;border-radius:4px;padding:1px 6px;vertical-align:middle;letter-spacing:.03em}
 /* screener */
 .scr-head{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:16px}
@@ -417,7 +418,7 @@ tbody tr:hover{background:var(--panel2)}
           <button data-min="6">Overall &ge;6</button>
           <button data-min="7">&ge;7</button>
         </div>
-        <button class="scr-toggle" id="scrShariah">\u262a Shariah only</button>
+        <button class="scr-toggle" id="scrShariah"><span class="s-badge">S</span> Shariah only</button>
       </div>
     </div>
     <div id="scrBody"></div>
@@ -457,7 +458,7 @@ DATA.snapshot.top_n.forEach((r,i)=>{
   d.className='row'+(isnew?' isnew':'');
   d.dataset.sym=r.symbol; d.dataset.close=r.close;
   d.innerHTML=`<span class="rank">${i+1}</span>
-    <span class="sym">${r.symbol}${(DATA.shariah&&DATA.shariah[r.symbol])?'<span class="sh-mini" title="Shariah-compliant (KMI)">\u262a</span>':''}${isnew?'<span class="ndot">NEW</span>':''}</span>
+    <span class="sym">${r.symbol}${(DATA.shariah&&DATA.shariah[r.symbol])?'<span class="sh-mini" title="Shariah-compliant (KMI)"><span class="s-badge">S</span></span>':''}${isnew?'<span class="ndot">NEW</span>':''}</span>
     <span class="vol">${fmtV(r.volume)}</span>
     <span class="chg ${cls(r.change_pct)}">${sign(r.change_pct)}%</span>`;
   d.onclick=()=>loadChart(r.symbol,r.close,d);
@@ -1028,7 +1029,7 @@ function openDetail(sym){
   const A=TA.analyze(ch);
   const px=A.px, prev=ch.c[ch.c.length-2], chg=(px-prev)/prev*100;
   const _sh=(DATA.shariah&&DATA.shariah[sym]);
-  document.getElementById('dtSym').innerHTML=sym+(_sh?' <span class="shariah-badge" title="Shariah-compliant (KMI index)">\u262a Shariah</span>':'');
+  document.getElementById('dtSym').innerHTML=sym+(_sh?' <span class="shariah-badge"><span class="s-badge">S</span> Shariah</span>':'');
   document.getElementById('dtMeta').textContent=(co&&co.name?co.name+' \u00b7 ':'')+(sector?sector+' \u00b7 ':'')+px.toFixed(2)+' ('+(chg>=0?'+':'')+chg.toFixed(2)+'%)';
 
   const card=(t,inner,full)=>'<div class="dt-card'+(full?' dt-full':'')+'"><h3>'+t+'</h3>'+inner+'</div>';
@@ -1298,7 +1299,7 @@ function _paintScreener(){
     +'<th data-k="px" class="hide-sm">Price'+arrow('px')+'</th></tr></thead><tbody>';
   rows.forEach((r,i)=>{
     const strong=r.tech>=6.5&&r.fund!=null&&r.fund>=6.5;
-    const badge=r.shariah?'<span class="sh-mini" title="Shariah-compliant">\u262a</span>':'';
+    const badge=r.shariah?'<span class="sh-mini" title="Shariah-compliant"><span class="s-badge">S</span></span>':'';
     const sc=(v)=>'<span class="scr-score" style="color:'+_scol(v)+';background:'+_scol(v)+'1a">'+(v==null?'\u2014':v.toFixed(1))+'</span>';
     html+='<tr data-sym="'+r.sym+'"'+(strong?' class="strong"':'')+'>'
       +'<td class="scr-rank">'+(i+1)+'</td>'
