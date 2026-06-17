@@ -32,12 +32,24 @@ def _cnum(s):
         return None
 
 
-def _fetch_company(sym):
-    """Parse fundamentals, insider filings and catalysts from the PSX company page."""
-    try:
-        req = urllib.request.Request(f"https://dps.psx.com.pk/company/{sym}", headers=UA)
-        html = urllib.request.urlopen(req, timeout=25).read().decode("utf-8", "ignore")
-    except Exception:
+def _fetch_company(sym, retries=3):
+    """Parse fundamentals, insider filings and catalysts from the PSX company page.
+    Retries with backoff since shared/cloud IPs (e.g. GitHub Actions runners) can
+    get rate-limited by PSX more readily than a residential/dev IP."""
+    import time, random
+    html = None
+    last_err = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(f"https://dps.psx.com.pk/company/{sym}", headers=UA)
+            html = urllib.request.urlopen(req, timeout=25).read().decode("utf-8", "ignore")
+            break
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(1.5 * (attempt + 1) + random.random())
+    if html is None:
+        print(f"  [company] {sym}: FAILED after {retries} attempts ({last_err})")
         return None
     soup = BeautifulSoup(html, "lxml")
     T = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
@@ -133,10 +145,15 @@ def _fetch_company(sym):
 def _fetch_companies(symbols):
     out = {}
     print(f"Fetching company fundamentals for {len(symbols)} symbols…")
-    with ThreadPoolExecutor(max_workers=12) as ex:
+    with ThreadPoolExecutor(max_workers=6) as ex:
         for sym, c in ex.map(lambda s: (s, _fetch_company(s)), symbols):
             if c:
                 out[sym] = c
+    failed = len(symbols) - len(out)
+    print(f"  -> got {len(out)}/{len(symbols)} ({failed} failed)")
+    if len(out) == 0 and len(symbols) > 0:
+        print("  WARNING: zero companies fetched — fundamentals section will be "
+              "empty on the dashboard. Likely PSX rate-limiting this runner's IP.")
     return out
 
 
