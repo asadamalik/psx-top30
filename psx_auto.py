@@ -158,6 +158,23 @@ def main():
     det = snaps_to_det(snaps)
     embed = build_lib.compute_embed(det, fetch_charts=True)
 
+    # Fundamentals (companies) are re-fetched from PSX every run and can fail
+    # wholesale if PSX rate-limits this runner's IP (shared GitHub Actions IPs
+    # are more exposed to this than a residential/dev IP). Persist last-known-good
+    # per symbol and only overwrite a symbol's entry when a fresh fetch actually
+    # succeeded, so a bad run shows yesterday's fundamentals instead of nothing.
+    companies_path = os.path.join(STATE, "companies.json")
+    companies_cache = json.load(open(companies_path)) if os.path.exists(companies_path) else {}
+    fresh = embed.get("companies", {}) or {}
+    print(f"Fundamentals: {len(fresh)} fetched fresh this run, "
+          f"{len(companies_cache)} cached from previous runs.")
+    companies_cache.update(fresh)   # fresh data wins per-symbol; stale symbols keep last-known-good
+    try:
+        json.dump(companies_cache, open(companies_path, "w"))
+    except Exception:
+        pass
+    embed["companies"] = companies_cache
+
     # attach a symbol -> sector map (from the full market-watch) and a build time,
     # persisted so it stays populated even on weekend/holiday runs
     sectors = json.load(open(os.path.join(STATE, "sectors.json"))) \
