@@ -1,14 +1,24 @@
 name: psx-dashboard
 
-# Runs every trading day at 9:00 PM Pakistan time and republishes the dashboard.
-# Pakistan is UTC+5 (no daylight saving), so 21:00 PKT = 16:00 UTC.
-# You can ALSO run it by hand any time from the Actions tab -> "Run workflow"
-# (use that for a 12 PM / 8 PM / 10 PM / 1 AM run whenever you want a fresh pull).
-# GitHub cron is in UTC and can be delayed 10-30 min at peak — fine after the close.
+# Runs every trading day shortly after market close and republishes the dashboard.
+# Pakistan is UTC+5 (no daylight saving). Scheduled for 21:07 PKT = 16:07 UTC —
+# a few minutes off the top of the hour, since GitHub Actions queues are busiest
+# right on the hour (xx:00) and scheduled runs can be delayed or skipped if you
+# fire at a "hot" minute on a low-traffic repo.
+#
+# You can ALSO run it by hand any time from the Actions tab -> "Run workflow".
+#
+# NOTE: every time this schedule line changes, GitHub re-registers it and the
+# very first scheduled run after that can take 15-60 min past the target time
+# to be picked up. That's expected once, not a bug.
 on:
   schedule:
-    - cron: "0 16 * * 1-5"      # Mon–Fri, 16:00 UTC = 21:00 Pakistan time
+    - cron: "7 16 * * 1-5"      # Mon–Fri, 16:07 UTC = 21:07 Pakistan time
   workflow_dispatch: {}          # the manual "Run workflow" button
+
+concurrency:
+  group: psx-dashboard
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -34,6 +44,7 @@ jobs:
           cp psx_dashboard.html index.html      # serve at the Pages root
           git config user.name  "psx-bot"
           git config user.email "psx-bot@users.noreply.github.com"
-          git add psx_dashboard.html index.html psx_data  
+          git add psx_dashboard.html index.html psx_data
           git commit -m "PSX update $(date -u +%F)" || echo "no changes to commit"
+          git pull --rebase --autostash
           git push
