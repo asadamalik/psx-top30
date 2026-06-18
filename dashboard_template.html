@@ -313,6 +313,12 @@ tbody tr:hover{background:var(--panel2)}
 @media(max-width:680px){.scr-tbl .hide-sm{display:none}}
 .dt-cta{display:inline-flex;align-items:center;gap:6px;margin-top:12px;font-family:var(--disp);font-size:12px;font-weight:600;color:var(--signal);background:rgba(232,176,75,.1);border:1px solid var(--signal-dim);border-radius:8px;padding:9px 14px;text-decoration:none;transition:.12s}
 .dt-cta:hover{background:rgba(232,176,75,.2)}
+.plan-chart-wrap{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 16px 10px;margin:14px 0}
+.plan-chart-h{font-size:10px;text-transform:uppercase;letter-spacing:.12em;color:var(--dim);margin-bottom:10px;font-weight:600}
+#planChart{width:100%;height:260px;display:block}
+.plan-chart-legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;font-family:var(--mono);font-size:11px;color:var(--dim)}
+.plan-chart-legend .lg{display:inline-flex;align-items:center;gap:5px}
+.plan-chart-legend .sw{width:10px;height:2px;display:inline-block}
 </style>
 
 <div class="wrap">
@@ -405,6 +411,12 @@ tbody tr:hover{background:var(--panel2)}
       <button class="dt-back" id="dtBack">← Back</button>
       <div class="dt-title"><h2 id="dtSym">—</h2><span class="dt-meta" id="dtMeta"></span></div>
       <div class="dt-links" id="dtLinks"></div>
+    </div>
+    <div id="dtThesis"></div>
+    <div class="plan-chart-wrap" id="planChartWrap" hidden>
+      <h3 class="plan-chart-h">Trading plan on chart</h3>
+      <canvas id="planChart"></canvas>
+      <div class="plan-chart-legend" id="planChartLegend"></div>
     </div>
     <div id="dtBody"></div>
   </div>
@@ -895,11 +907,21 @@ function analyze(series){
 
   // ---- trading plan (mechanical, from S/R + ATR-ish) ----
   const atr=(()=>{let t=0,n=0;for(let i=N-14;i<N;i++){if(i>0){t+=Math.max(hi[i]-lo[i],Math.abs(hi[i]-c[i-1]));n++;}}return n?t/n:px*0.02;})();
-  const r1=resistances[0]?resistances[0].level:px*1.05, r2=resistances[1]?resistances[1].level:px*1.1, r3=resistances[2]?resistances[2].level:px*1.15;
   const sup1=supports[0]?supports[0].level:px*0.95;
+  const stopLevel = +Math.max(sup1*0.99, px-2*atr).toFixed(2);
+  const riskDist = Math.max(px - stopLevel, atr*0.5);   // distance we're risking
+
+  // T1 must clear at least a 1.2:1 reward:risk vs the actual stop, AND represent a
+  // real move (not noise) — whichever is further from price wins, so thin resistance
+  // data or a distant stop can't silently produce a poor risk:reward setup.
+  let r1=resistances[0]?resistances[0].level:px*1.05;
+  const r1Floor = Math.max(px*1.025, px + riskDist*1.2);
+  if(r1 < r1Floor) r1 = r1Floor;
+  const r2=resistances[1]&&resistances[1].level>r1?resistances[1].level:Math.max(r1*1.035,px+riskDist*2);
+  const r3=resistances[2]&&resistances[2].level>r2?resistances[2].level:Math.max(r2*1.035,px+riskDist*3);
   const plan={
     entry:[+(px-0.3*atr).toFixed(2),+(px+0.3*atr).toFixed(2)],
-    stop:+Math.max(sup1*0.99,px-2*atr).toFixed(2),
+    stop:stopLevel,
     t1:+r1.toFixed(2),t2:+r2.toFixed(2),t3:+r3.toFixed(2)};
   const risk=px-plan.stop, reward=plan.t1-px;
   plan.rr=risk>0?+(reward/risk).toFixed(2):null;
@@ -983,6 +1005,146 @@ function detectPatterns({c,hi,lo,v,N,px,piv,MA50,vavg}){
 return {analyze};
 })();
 
+const THESIS=(function(){
+// ===== Investment thesis synthesis (mechanical, built from TA.analyze() + computeFundScore) =====
+// No institutional-ownership data exists in PSX's free feed, so that section is omitted
+// entirely rather than guessed. Insider section reuses the same filings already parsed
+// (dates + buy/sell read only - no shares/price, which PSX doesn't expose as text).
+
+function insiderRead(co){
+  const filings=(co&&co.insider)||[];
+  let buys=0, sells=0;
+  const rows=filings.map(it=>{
+    const t=(it[1]||'').toLowerCase();
+    const isBuy=/acqui|purchase|bought|\bbuy\b/.test(t);
+    const isSell=/dispos|sold|\bsell\b/.test(t);
+    if(isBuy)buys++; if(isSell)sells++;
+    return {date:it[0], text:it[1], type:isBuy?'Buy':isSell?'Sell':'Filing'};
+  });
+  let label,score;
+  if(filings.length===0){label='Neutral (no recent filings)';score=50;}
+  else if(buys>=2&&sells===0){label='Strong insider buying';score=80;}
+  else if(buys>sells){label='Moderate insider buying';score=65;}
+  else if(sells>buys){label='Insider selling';score=30;}
+  else {label='Neutral';score=50;}
+  return {rows, buys, sells, label, score};
+}
+
+function riskRead(A, co, fScore){
+  const risks=[];
+  // technical risk: volatility / overbought-ness / weak trend
+  const volRisk = A.adx<20 ? 'High' : A.adx<25 ? 'Medium' : 'Low';
+  risks.push({cat:'Technical', level: A.rsi>=75?'High':A.rsi>=70?'Medium':'Low',
+    note: A.rsi>=70?'RSI overbought — pullback risk elevated.':'RSI not in overbought territory.'});
+  risks.push({cat:'Trend strength', level: volRisk,
+    note: A.adx<20?'ADX below 20 — trend is weak/ranging, signals less reliable.':'Trend has enough strength to act on.'});
+  // financial risk: from fundamentals
+  let finLevel='Medium', finNote='Limited fundamental data available.';
+  if(co){
+    const e0=(co.eps||[])[0], peg=(co.peg||[])[0], nm=(co.net_margin||[])[0];
+    if(e0!=null&&e0<0){finLevel='High'; finNote='Latest annual EPS is negative.';}
+    else if(nm!=null&&nm<0){finLevel='High'; finNote='Negative net margin in the latest period.';}
+    else if(peg!=null&&peg>3){finLevel='Medium'; finNote='PEG above 3 suggests rich valuation relative to growth.';}
+    else if(fScore!=null&&fScore>=66){finLevel='Low'; finNote='Profitable with reasonable valuation metrics.';}
+    else {finLevel='Medium'; finNote='Mixed fundamentals — no major red flag, no strong cushion either.';}
+  }
+  risks.push({cat:'Financial', level:finLevel, note:finNote});
+  // industry/regulatory: generic, sector-aware only where obvious; otherwise neutral disclosure
+  risks.push({cat:'Industry & regulatory', level:'Medium',
+    note:'Sector-wide and regulatory risk applies to all PSX-listed companies and isn\u2019t separately quantified here \u2014 use the sector context in the overview above.'});
+  const order={High:3,Medium:2,Low:1};
+  const overall = risks.reduce((a,r)=>a+order[r.level],0)/risks.length;
+  const overallLabel = overall>=2.5?'High':overall>=1.7?'Medium':'Low';
+  return {items:risks, overallLabel};
+}
+
+function bullBear(A, co, fScore, insider){
+  const bull=[], bear=[];
+  if(A.daily==='Bullish'||A.weekly==='Bullish') bull.push('Trend: '+(A.weekly==='Bullish'?'weekly':'daily')+' trend is bullish.');
+  if(A.diCross==='Bullish crossover') bull.push('DMI: bullish DI crossover, buyers in control.');
+  if(A.rsiDiv.bull) bull.push('RSI: bullish divergence \u2014 momentum improving while price was flat/down.');
+  if(A.rvol>=1.5 && A.accDist==='Accumulation') bull.push('Volume: elevated volume on accumulation.');
+  if(co){
+    const g=(co.eps_growth||[])[0]; if(g!=null&&g>15) bull.push('Earnings: EPS growth of '+g.toFixed(0)+'% YoY.');
+    if(co.pe!=null&&co.pe>0&&co.pe<12) bull.push('Valuation: P/E of '+co.pe.toFixed(1)+' is on the low side.');
+  }
+  if(co&&co.catalysts&&co.catalysts.length) bull.push('Catalyst: recent announcement on file \u2014 see Catalysts card.');
+  if(insider.label.includes('buying')) bull.push('Insider: '+insider.label.toLowerCase()+'.');
+
+  if(A.daily==='Bearish'||A.weekly==='Bearish') bear.push('Trend: '+(A.weekly==='Bearish'?'weekly':'daily')+' trend is bearish.');
+  if(A.rsiZone==='Overbought') bear.push('RSI: overbought at '+A.rsi+', pullback risk.');
+  if(A.diCross==='Bearish crossover') bear.push('DMI: bearish DI crossover, sellers in control.');
+  if(co){
+    const g=(co.eps_growth||[])[0]; if(g!=null&&g<0) bear.push('Earnings: EPS growth negative ('+g.toFixed(0)+'%).');
+    if(co.pe!=null&&co.pe>22) bear.push('Valuation: P/E of '+co.pe.toFixed(1)+' is elevated.');
+    const e0=(co.eps||[])[0]; if(e0!=null&&e0<0) bear.push('Earnings: latest annual EPS is negative.');
+  }
+  if(insider.label==='Insider selling') bear.push('Insider: net selling in recent filings.');
+  if(A.patterns.some(p=>p.bias==='Bearish')) bear.push('Pattern: a bearish chart pattern is flagged (see Pattern detection).');
+  if(bull.length===0) bull.push('No strong bullish signal currently active.');
+  if(bear.length===0) bear.push('No strong bearish signal currently active.');
+  return {bull, bear};
+}
+
+function qualifyingSignals(A, co, fScore, insider){
+  const sig=[];
+  const add=(name,note)=>sig.push({name,note});
+  if(A.rsiZone==='Oversold') add('RSI Oversold','RSI at '+A.rsi+', historically a mean-reversion zone.');
+  if(A.rsiZone==='Overbought') add('RSI Overbought','RSI at '+A.rsi+' \u2014 caution on chasing further upside.');
+  if(A.rsiDiv.bull) add('Bullish Divergence','Price made a lower low while RSI made a higher low.');
+  if(A.rsiDiv.bear) add('Bearish Divergence','Price made a higher high while RSI made a lower high.');
+  if(A.adx>=25) add('ADX Rising / Strong Trend','ADX at '+A.adx+' \u2014 trend has conviction.');
+  if(A.diCross!=='No active signal') add('DI Crossover', A.diCross+' on the DMI.');
+  if(co){
+    const g=(co.eps_growth||[])[0]; if(g!=null&&g>20) add('EPS Growth Improving','EPS growth of '+g.toFixed(0)+'% YoY.');
+    if(co.pe!=null&&co.pe>0&&co.pe<12) add('Low P/E','P/E of '+co.pe.toFixed(1)+'.');
+  }
+  if(insider.buys>0) add('Director/Sponsor Buying', insider.buys+' buy-side filing(s) on record.');
+  if(co&&co.catalysts&&co.catalysts.length) add('Business Catalyst', 'Recent PSX announcement on file.');
+  if(A.patterns[0]) add(A.patterns[0].name, A.patterns[0].bias+' pattern at '+A.patterns[0].confidence+'% confidence.');
+  if(sig.length===0) add('No standout signal','Scores are middling across the board \u2014 not a strong setup either way.');
+  return sig;
+}
+
+function finalVerdict(tech10, fund10, insiderScore, riskLabel, hasInsiderData){
+  // 0-100 conviction: weighted blend; risk acts as a damper, not a separate input score.
+  // Insider direction is weighted heavily WHEN PRESENT — experienced traders treat
+  // director/sponsor buying as a primary signal, not a footnote. But most stocks have
+  // no recent filings most of the time, and that absence is not itself bearish — so when
+  // there's nothing on file, insider contributes zero influence rather than a flat 50
+  // that would otherwise drag every undocumented stock's score down for no real reason.
+  const f10 = fund10!=null?fund10:5;
+  let conv;
+  if(hasInsiderData){
+    const ins10 = insiderScore/10;
+    conv = (tech10*0.35 + f10*0.30 + ins10*0.35)*10;
+  } else {
+    conv = (tech10*0.5 + f10*0.5)*10;
+  }
+  const riskMult = riskLabel==='High'?0.85:riskLabel==='Medium'?0.95:1.0;
+  conv = Math.round(conv*riskMult);
+  conv = Math.max(0,Math.min(100,conv));
+  let verdict;
+  if(conv>=78 && riskLabel!=='High') verdict='Strong Buy Candidate';
+  else if(conv>=65) verdict='Buy Candidate';
+  else if(conv>=50) verdict='Watchlist Candidate';
+  else if(conv>=35) verdict='Speculative Opportunity';
+  else verdict='Avoid';
+  return {conviction:conv, verdict};
+}
+
+function targetHeadline(A){
+  const pl=A.plan;
+  const upT1=((pl.t1/A.px-1)*100), upT2=((pl.t2/A.px-1)*100);
+  return {
+    entry: pl.entry, stop: pl.stop, t1: pl.t1, t2: pl.t2, t3: pl.t3,
+    t1pct: +upT1.toFixed(1), t2pct: +upT2.toFixed(1),
+    rr: pl.rr
+  };
+}
+return {insiderRead, riskRead, bullBear, qualifyingSignals, finalVerdict, targetHeadline};
+})();
+
 // ===== stock detail page : full technical report (engine: TA.analyze) =====
 function computeFundScore(co){
   if(!co) return null;
@@ -1005,6 +1167,61 @@ function _verdictText(A){
   return lead+' — '+bits.slice(0,3).join(', ')+'.';
 }
 
+function drawPlanChart(ch, A, col){
+  const wrap=document.getElementById('planChartWrap'), cv=document.getElementById('planChart');
+  wrap.hidden=false;
+  const dpr=window.devicePixelRatio||1;
+  const cssW=cv.parentElement.clientWidth, cssH=260;
+  cv.width=cssW*dpr; cv.height=cssH*dpr; cv.style.width=cssW+'px'; cv.style.height=cssH+'px';
+  const g=cv.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,cssW,cssH);
+
+  const N=Math.min(ch.c.length,90);                 // last ~90 sessions for context
+  const closes=ch.c.slice(-N);
+  const pl=A.plan;
+  const pad={t:14,b:22,l:8,r:64};
+  const lo=Math.min(...closes, pl.stop), hi=Math.max(...closes, pl.t3);
+  const range=(hi-lo)||1;
+  const y=p=>cssH-pad.b-((p-lo)/range)*(cssH-pad.t-pad.b);
+  const x=i=>pad.l+(i/(closes.length-1))*(cssW-pad.l-pad.r);
+
+  // gridline + label for a level
+  function hline(val,color,label,dashed){
+    const yy=y(val);
+    g.save();
+    g.strokeStyle=color; g.lineWidth=1; g.globalAlpha=0.85;
+    if(dashed) g.setLineDash([4,3]);
+    g.beginPath(); g.moveTo(pad.l,yy); g.lineTo(cssW-pad.r,yy); g.stroke();
+    g.restore();
+    g.fillStyle=color; g.font='600 11px "IBM Plex Mono",monospace'; g.textBaseline='middle';
+    g.fillText(label+' '+val.toFixed(2), cssW-pad.r+6, yy);
+  }
+
+  // entry zone shading
+  const ey1=y(pl.entry[0]), ey0=y(pl.entry[1]);
+  g.fillStyle=col.sig+'22'; g.fillRect(pad.l, Math.min(ey0,ey1), cssW-pad.l-pad.r, Math.abs(ey1-ey0)||1);
+
+  hline(pl.t3, col.up, 'T3', true);
+  hline(pl.t2, col.up, 'T2', true);
+  hline(pl.t1, col.up, 'T1', false);
+  hline(pl.stop, col.down, 'Stop', false);
+
+  // price line
+  g.beginPath(); g.strokeStyle=col.text; g.lineWidth=1.6;
+  closes.forEach((p,i)=>{ const px=x(i), py=y(p); i===0?g.moveTo(px,py):g.lineTo(px,py); });
+  g.stroke();
+  // last price dot
+  const lastX=x(closes.length-1), lastY=y(closes[closes.length-1]);
+  g.beginPath(); g.fillStyle=col.text; g.arc(lastX,lastY,3,0,7); g.fill();
+  g.fillStyle=col.text; g.font='600 11px "IBM Plex Mono",monospace'; g.textBaseline='middle';
+  g.fillText(closes[closes.length-1].toFixed(2), Math.min(lastX+6,cssW-pad.r-46), lastY);
+
+  document.getElementById('planChartLegend').innerHTML=
+    '<span class="lg"><span class="sw" style="background:'+col.sig+'"></span>Entry zone '+pl.entry[0]+'\u2013'+pl.entry[1]+'</span>'+
+    '<span class="lg"><span class="sw" style="background:'+col.down+'"></span>Stop '+pl.stop+'</span>'+
+    '<span class="lg"><span class="sw" style="background:'+col.up+'"></span>Targets T1/T2/T3</span>'+
+    '<span class="lg">R:R to T1 '+(pl.rr!=null?(pl.rr>8?'8+':pl.rr)+':1':'\u2014')+'</span>';
+}
+
 function openDetail(sym){
   const cs=getComputedStyle(document.documentElement), C=k=>cs.getPropertyValue(k).trim();
   const col={up:C('--up'),down:C('--down'),sig:C('--signal'),line:C('--line'),text:C('--text'),dim:C('--dim'),d2:C('--dim2')};
@@ -1021,9 +1238,11 @@ function openDetail(sym){
     '<a href="https://dps.psx.com.pk/company/'+sym+'" target="_blank" rel="noopener">PSX profile \u2197</a>'+
     '<a href="https://sarmaaya.pk/stocks/'+sym+'" target="_blank" rel="noopener">Sarmaaya \u2197</a>';
   const ch=DATA.charts&&DATA.charts[sym];
+  document.getElementById('planChartWrap').hidden=true;
   if(!ch||ch.c.length<30){
     document.getElementById('dtMeta').textContent=sector;
     document.getElementById('dtBody').innerHTML='<div class="dt-card"><div class="dt-note">Not enough price history to analyse '+sym+'. Use the links above.</div></div>';
+    document.getElementById('dtThesis').innerHTML='';
     return;
   }
   const A=TA.analyze(ch);
@@ -1244,6 +1463,58 @@ function openDetail(sym){
     +'<div class="dt-sec">Insider</div>'
     +'<div class="dt-grid">'+insiderCard+'</div>'
     +'<div class="dt-disc">Technical readings come from historical PSX price &amp; volume (Open\u2192Close candles \u2014 no intraday high/low \u2014 so ADX/DMI, levels, patterns &amp; the trading plan are approximations; pattern detection is heuristic). Fundamentals, insider filings &amp; announcements are parsed from PSX\u2019s company page; book value, P/B, dividend yield, debt &amp; cash-flow are not in that feed and are shown as such. Scores are mechanical &amp; transparent. This is information, <b>not financial advice</b> \u2014 do your own research.</div>';
+
+  // ===== Ownership & Investment Thesis (mechanical synthesis) =====
+  // Institutional Holdings / Mutual Funds / Banks / Insurance / Foreign Investors /
+  // Shareholding Pattern are NOT in PSX's free feed at all (confirmed directly against
+  // the live page) — that section is omitted entirely rather than guessed.
+  const ins=THESIS.insiderRead(co);
+  const risk=THESIS.riskRead(A, co, fScore);
+  const bb=THESIS.bullBear(A, co, fScore, ins);
+  const sig=THESIS.qualifyingSignals(A, co, fScore, ins);
+  const hasInsiderData=!!(co&&co.insider&&co.insider.length>0);
+  const fv=THESIS.finalVerdict(A.score, (fScore!=null?+(fScore/10).toFixed(1):null), ins.score, risk.overallLabel, hasInsiderData);
+  const th=THESIS.targetHeadline(A);
+
+  const vColMap={'Strong Buy Candidate':col.up,'Buy Candidate':col.up,'Watchlist Candidate':col.sig,'Speculative Opportunity':col.sig,'Avoid':col.down};
+  const vCol2=vColMap[fv.verdict]||col.sig;
+  const riskColMap={Low:col.up,Medium:col.sig,High:col.down};
+
+  const thesisVerdict='<div class="dt-verdict" style="border-color:'+vCol2+'55">'
+    +'<div class="vcell"><div class="vlabel">Conviction</div><div class="vscore" style="color:'+vCol2+'">'+fv.conviction+'<span>/100</span></div></div>'
+    +'<div class="vcell"><div class="vlabel">Verdict</div><div class="voutlook" style="color:'+vCol2+'">'+fv.verdict+'</div></div>'
+    +'<div class="vtext">Target <b style="color:'+col.up+'">'+th.t1+'</b> ('+(th.t1pct>=0?'+':'')+th.t1pct+'%) \u00b7 Stop <b style="color:'+col.down+'">'+th.stop+'</b> \u00b7 R:R '+(th.rr!=null?(th.rr>8?'8+':th.rr)+':1':'\u2014')+' \u2014 mechanical synthesis of technical, fundamental &amp; insider signals below. Not a recommendation.</div></div>';
+
+  const sigCard=card('Why this stock qualified', sig.map(s=>
+    '<div class="dt-row" style="align-items:flex-start"><span class="k" style="flex:none;width:auto;color:'+col.text+';font-weight:600">'+s.name+'</span><span class="v" style="text-align:right;font-weight:400;color:var(--dim);font-family:var(--disp)">'+s.note+'</span></div>').join(''), true);
+
+  const insiderThesisCard=card('Insider activity & confidence',
+    '<div class="dt-row"><span class="k">Read</span><span class="v" style="color:'+(ins.score>=65?col.up:ins.score<=35?col.down:col.sig)+'">'+ins.label+'</span></div>'
+    +row('Insider confidence score', (ins.score/10).toFixed(1)+'/10')
+    +(ins.rows.length?ins.rows.slice(0,4).map(r=>'<div class="dt-row"><span class="k" style="font-size:11px">'+r.date+' \u00b7 '+r.type+'</span><span style="font-size:11px;color:var(--text);text-align:right;max-width:60%">'+r.text+'</span></div>').join(''):'<div class="dt-note">No recent director/sponsor filings on record.</div>')
+    +'<div class="dt-note" style="margin-top:6px">Share count &amp; price aren\u2019t shown \u2014 PSX files these as scanned images, not data.</div>'
+    +'<a class="dt-cta" href="https://sarmaaya.pk/stocks/'+sym+'" target="_blank" rel="noopener">Check insider transactions on Sarmaaya \u2192</a>', true);
+
+  const riskCard=card('Risk analysis',
+    risk.items.map(r=>'<div class="dt-row"><span class="k">'+r.cat+'</span><span class="v" style="color:'+riskColMap[r.level]+'">'+r.level+'</span></div>'+
+      '<div class="dt-note" style="margin:0 0 8px">'+r.note+'</div>').join('')
+    +'<div class="dt-row" style="border-top:1px solid var(--line);padding-top:8px;margin-top:4px"><span class="k">Overall risk</span><span class="v" style="color:'+riskColMap[risk.overallLabel]+'">'+risk.overallLabel+'</span></div>', true);
+
+  const bullCard=card('Bull case', bb.bull.map(b=>'<div class="dt-note" style="color:'+col.up+';margin-bottom:5px">\u25b2 '+b+'</div>').join(''), false);
+  const bearCard=card('Bear case', bb.bear.map(b=>'<div class="dt-note" style="color:'+col.down+';margin-bottom:5px">\u25bc '+b+'</div>').join(''), false);
+
+  const scoreRow=card('Final scoring',
+    row('Technical',A.score.toFixed(1)+'/10')+row('Fundamental',(fScore!=null?(fScore/10).toFixed(1):'\u2014')+'/10')
+    +row('Insider confidence',(ins.score/10).toFixed(1)+'/10')+row('Risk',risk.overallLabel)
+    +row('Overall conviction','<b style="color:'+vCol2+'">'+fv.conviction+'/100</b>'), false);
+
+  document.getElementById('dtThesis').innerHTML=
+    '<div class="dt-sec" style="margin-top:0">Ownership & investment thesis</div>'
+    +thesisVerdict
+    +'<div class="dt-grid" style="margin-top:14px">'+scoreRow+sigCard+bullCard+bearCard+riskCard+insiderThesisCard+'</div>'
+    +'<div class="dt-disc">Institutional holdings, mutual fund / bank / insurance / foreign-investor breakdowns and full shareholding pattern are <b>not available</b> from PSX\u2019s free data feed, so that section is omitted rather than estimated. This synthesis combines the technical, fundamental and insider-filing signals already shown on this page using a fixed, transparent formula \u2014 it is not investment advice.</div>';
+
+  drawPlanChart(ch, A, col);
 }
 
 document.getElementById('analyzeBtn').addEventListener('click',()=>{ if(curSym) openDetail(curSym); });
